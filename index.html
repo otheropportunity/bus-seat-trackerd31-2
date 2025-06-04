@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>🚌 Bus Seat Availability Tracker - D31 - 2</title>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background: #f0f4f8;
+      padding: 20px;
+    }
+    h1 {
+      margin-bottom: 10px;
+    }
+    #seat-stats, #legend {
+      font-size: 18px;
+      margin-bottom: 15px;
+    }
+    .legend-box {
+      display: inline-flex;
+      align-items: center;
+      margin: 0 10px;
+    }
+    .color-box {
+      width: 20px;
+      height: 20px;
+      border-radius: 4px;
+      margin-right: 5px;
+      display: inline-block;
+    }
+    .green { background-color: #28a745; }
+    .yellow { background-color: #ffc107; }
+    .red { background-color: #dc3545; }
+    .bus {
+      display: grid;
+      grid-template-columns: repeat(5, 80px);
+      gap: 10px;
+      justify-content: center;
+      margin-bottom: 20px;
+    }
+    .seat, .label {
+      width: 80px;
+      height: 80px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 16px;
+      user-select: none;
+      transition: background-color 0.3s ease;
+    }
+    .seat {
+      background-color: #28a745;
+      color: white;
+      cursor: pointer;
+    }
+    .seat.selected {
+      background-color: #ffc107;
+      color: black;
+    }
+    .seat.pending-other {
+      background-color: #ffdb99;
+      color: black;
+      cursor: not-allowed;
+    }
+    .seat.taken {
+      background-color: #dc3545;
+      cursor: not-allowed;
+      color: white;
+    }
+    .label {
+      background-color: #ccc;
+      cursor: default;
+    }
+    #lockBtn, #resetBtn {
+      padding: 10px 20px;
+      font-size: 16px;
+      margin: 10px;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      user-select: none;
+    }
+    #resetBtn {
+    padding: 10px 20px;
+    font-size: 16px;
+    margin: 10px;
+    background-color: #dc3545; /* red */
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    user-select: none;
+    }
+    #lockBtn:disabled, #resetBtn:disabled {
+      background-color: #6c757d;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+
+<h1>🚌 Bus Seat Availability Tracker D31-2</h1>
+
+<!-- Seat Statistics -->
+<div id="seat-stats">Loading seat data...</div>
+
+<!-- Color Legend -->
+<div id="legend">
+  <span class="legend-box"><span class="color-box green"></span> Available</span>
+  <span class="legend-box"><span class="color-box yellow"></span> Pending</span>
+  <span class="legend-box"><span class="color-box red"></span> Taken</span>
+</div>
+
+<!-- Seat Grid -->
+<div class="bus" id="bus"></div>
+
+<!-- Action Buttons -->
+<button id="lockBtn">Lock Seat</button>
+<button id="resetBtn">Reset All</button>
+
+<script>
+  const firebaseConfig = {
+  apiKey: "AIzaSyAcQd5wDPMbAxR6pEQw6n_LgEdThF_eroU",
+  authDomain: "bus-seat-allocation-d31.firebaseapp.com",
+  databaseURL: "https://bus-seat-allocation-d31-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "bus-seat-allocation-d31",
+  storageBucket: "bus-seat-allocation-d31.firebasestorage.app",
+  messagingSenderId: "247634907615",
+  appId: "1:247634907615:web:6ccc4edecd576b7ed5f46a",
+  };
+
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.database();
+  const busId = "bus-002";
+  const busContainer = document.getElementById("bus");
+  const lockBtn = document.getElementById("lockBtn");
+  const resetBtn = document.getElementById("resetBtn");
+
+  const userId = localStorage.getItem("userId") || (() => {
+    const id = 'user-' + Math.random().toString(36).substr(2, 9);
+    localStorage.setItem("userId", id);
+    return id;
+  })();
+
+  const seatLayout = [
+    "", "", "", "Driver", "",
+    "1", "", "", "", "",
+    "2", "3", "", "4", "5",
+    "6", "7", "", "8", "9",
+    "", "TAPIN/OUT", "", "10", "11",
+    "DOOR", "", "", "12", "13",
+    "DOOR", "", "", "14", "15",
+    "16", "17", "", "18", "19",
+    "20", "21", "", "22", "23",
+    "24", "25", "", "", "",
+    "26", "27", "28", "29", "30"
+  ];
+
+  let selectedSeats = new Set();
+  let isUpdating = false;
+  const PENDING_EXPIRY_MS = 20 * 1000;
+
+  async function cleanStalePendings(pendingData) {
+    const now = Date.now();
+    const cleanup = [];
+    for (const [seatKey, data] of Object.entries(pendingData || {})) {
+      if (!data.timestamp || (now - data.timestamp) > PENDING_EXPIRY_MS) {
+        cleanup.push(db.ref(`${busId}/pendingSelections/${seatKey}`).remove());
+      }
+    }
+    if (cleanup.length > 0) {
+      await Promise.all(cleanup);
+    }
+  }
+
+  async function renderSeats(data = {}) {
+    busContainer.innerHTML = "";
+    selectedSeats.clear();
+
+    const pending = data.pendingSelections || {};
+    await cleanStalePendings(pending);
+
+    const snapshot = await db.ref(busId).get();
+    const freshData = snapshot.val() || {};
+    const freshPending = freshData.pendingSelections || {};
+    const now = Date.now();
+
+    for (const label of seatLayout) {
+      const el = document.createElement("div");
+
+      if (["Driver", "DOOR", "TAPIN/OUT", "LUGGAGE", ""].includes(label)) {
+        el.className = "label";
+        el.innerText = label;
+      } else {
+        const seatKey = `seat${label}`;
+        const seatData = freshData[seatKey];
+        const pendingData = freshPending[seatKey];
+
+        el.className = "seat";
+        el.innerText = label;
+
+        if (seatData && seatData.taken) {
+          el.classList.add("taken");
+        } else if (pendingData && (now - pendingData.timestamp) <= PENDING_EXPIRY_MS) {
+          if (pendingData.userId === userId) {
+            el.classList.add("selected");
+            selectedSeats.add(label);
+          } else {
+            el.classList.add("pending-other");
+            el.title = "Seat pending by another user";
+            el.style.cursor = "not-allowed";
+          }
+        }
+
+        el.addEventListener("click", async () => {
+          if (isUpdating) return;
+          if (el.classList.contains("taken") || el.classList.contains("pending-other")) return;
+
+          isUpdating = true;
+          lockBtn.disabled = true;
+
+          try {
+            const seatKey = `seat${label}`;
+            if (selectedSeats.has(label)) {
+              await db.ref(`${busId}/pendingSelections/${seatKey}`).remove();
+              selectedSeats.delete(label);
+            } else {
+              const seatSnap = await db.ref(`${busId}/${seatKey}`).get();
+              if (seatSnap.exists() && seatSnap.val().taken) {
+                alert("Sorry, seat just got taken!");
+              } else {
+                await db.ref(`${busId}/pendingSelections/${seatKey}`).set({
+                  userId,
+                  timestamp: Date.now()
+                });
+                selectedSeats.add(label);
+              }
+            }
+          } catch (err) {
+            alert("Error updating seat.");
+          } finally {
+            isUpdating = false;
+            lockBtn.disabled = false;
+          }
+        });
+      }
+
+      busContainer.appendChild(el);
+    }
+
+    // Seat stats
+    const total = seatLayout.filter(label => label && !["Driver", "DOOR", "TAPIN/OUT", "LUGGAGE"].includes(label)).length;
+    let taken = 0, pendingCount = 0;
+
+    for (const label of seatLayout) {
+      const key = `seat${label}`;
+      if (freshData[key]?.taken) taken++;
+      else if (freshPending[key]) pendingCount++;
+    }
+
+    const available = total - taken - pendingCount;
+    document.getElementById("seat-stats").innerHTML = `
+      <strong>Total Seats:</strong> ${total} |
+      <strong>Available:</strong> ${available} |
+      <strong>Taken:</strong> ${taken} |
+      <strong>Pending:</strong> ${pendingCount}
+    `;
+  }
+
+  lockBtn.addEventListener("click", async () => {
+    if (isUpdating || selectedSeats.size === 0) {
+      alert("Please select at least one seat to lock.");
+      return;
+    }
+
+    lockBtn.disabled = true;
+    isUpdating = true;
+
+    const timestamp = Date.now();
+    const updates = {};
+
+    selectedSeats.forEach(seat => {
+      const seatKey = `seat${seat}`;
+      updates[`${busId}/${seatKey}`] = { taken: true, timestamp };
+      updates[`${busId}/pendingSelections/${seatKey}`] = null;
+    });
+
+    try {
+      await db.ref().update(updates);
+      selectedSeats.clear();
+    } catch (e) {
+      alert("Error locking seats: " + e.message);
+    }
+
+    isUpdating = false;
+    lockBtn.disabled = false;
+  });
+
+  resetBtn.addEventListener("click", async () => {
+    const input = prompt("Enter admin password to reset:");
+    if (input !== "D31BusRoyalTransCinere") {
+      alert("Incorrect password.");
+      return;
+    }
+
+    const updates = {};
+    for (const label of seatLayout) {
+      if (!["Driver", "DOOR", "TAPIN/OUT", "LUGGAGE", ""].includes(label)) {
+        updates[`${busId}/seat${label}`] = null;
+        updates[`${busId}/pendingSelections/seat${label}`] = null;
+      }
+    }
+
+    try {
+      await db.ref().update(updates);
+      alert("All seats reset to available.");
+    } catch (err) {
+      alert("Reset failed: " + err.message);
+    }
+  });
+
+  db.ref(busId).on("value", async (snapshot) => {
+    const data = snapshot.val() || {};
+    await renderSeats(data);
+  });
+</script>
+
+</body>
+</html>
